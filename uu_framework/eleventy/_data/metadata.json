@@ -1,4 +1,16 @@
 {
+  "aleatorio.md": {
+    "path": "clase/aleatorio.md",
+    "title": "Aleatorio",
+    "type": "lesson",
+    "order": 999,
+    "date": null,
+    "summary": null,
+    "tags": [],
+    "due_date": null,
+    "components": [],
+    "has_frontmatter": true
+  },
   "01_introduccion/00_index.md": {
     "path": "clase/01_introduccion/00_index.md",
     "title": "Introducción",
