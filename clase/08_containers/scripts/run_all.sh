@@ -37,6 +37,9 @@ BENCHMARKS=(
     "bench_io.sh:Disk I/O"
     "bench_nested.sh:Nested Containers"
     "bench_scale.sh:Scaling"
+    "bench_cpu_exec.sh:CPU Puro (exec)"
+    "bench_memory_cgroup.sh:Memory Cgroup"
+    "bench_nested_v2.sh:Nested Containers v2"
 )
 
 for entry in "${BENCHMARKS[@]}"; do

@@ -80,6 +80,110 @@ graph TB
 
 > **Tip**: Ordena tu Dockerfile de lo que cambia **menos** (SO base, dependencias) a lo que cambia **más** (tu código). Así aprovechas mejor el cache.
 
+### Capas por dentro: hashes y almacenamiento por contenido
+
+Si has usado **git**, el modelo de capas de Docker te va a resultar familiar. Ambos resuelven el mismo problema: almacenar versiones de algo de forma eficiente, sin duplicar lo que no cambió.
+
+En git, cada commit tiene un **hash SHA** que identifica su contenido. Si el contenido no cambia, el hash no cambia. Dos personas en distintas máquinas que hagan el mismo commit obtienen el mismo hash. Git no guarda copias completas de cada versión del repositorio — guarda los **diffs** (diferencias) entre versiones.
+
+Docker funciona con la misma idea. Cada capa de una imagen es un **diff del sistema de archivos**: qué archivos se agregaron, modificaron o eliminaron respecto a la capa anterior. Y cada capa se identifica con un **hash SHA-256** calculado a partir de su contenido.
+
+| Concepto | git | Docker |
+|----------|-----|--------|
+| Unidad de cambio | Commit | Capa (layer) |
+| Identificador | SHA-1 del contenido | SHA-256 del contenido |
+| Almacenamiento | Diffs entre versiones | Diffs del filesystem |
+| Reutilización | Si el contenido no cambió, mismo hash | Si la instrucción y contexto no cambiaron, misma capa |
+| Inmutabilidad | Un commit nunca cambia | Una capa nunca cambia |
+| Composición | Un branch es una cadena de commits | Una imagen es una pila de capas |
+
+Esto tiene una consecuencia práctica muy importante: Docker puede usar un **content-addressable store**. Es decir, las capas se guardan indexadas por su hash. Si dos imágenes comparten una capa (mismo hash), esa capa existe **una sola vez** en disco. Es la misma razón por la que git puede manejar miles de branches sin explotar en tamaño.
+
+### Cómo funciona el cache de capas
+
+Cuando ejecutas `docker build`, Docker procesa el Dockerfile instrucción por instrucción, de arriba hacia abajo. Para cada instrucción, se pregunta:
+
+1. ¿Ya tengo una capa cacheada para **exactamente esta instrucción** con **exactamente este contexto**?
+2. Si sí -> reutiliza la capa (instantáneo, no ejecuta nada).
+3. Si no -> ejecuta la instrucción, genera una nueva capa, y **todas las capas siguientes también se invalidan**.
+
+El punto 3 es clave: el cache es **secuencial**. Si una capa cambia, todas las capas que vienen **después** se reconstruyen, aunque su contenido no haya cambiado. Es como una cadena de dominós: si tumbas uno, caen todos los que siguen.
+
+```mermaid
+graph TB
+    subgraph build1["Primera vez (sin cache)"]
+        direction TB
+        A1["FROM python:3.11 ⏱ descarga"] --> B1["RUN pip install pandas ⏱ instala"]
+        B1 --> C1["COPY app.py . ⏱ copia"]
+        C1 --> D1["CMD python app.py ⏱ registra"]
+    end
+
+    subgraph build2["Segunda vez, solo cambió app.py"]
+        direction TB
+        A2["FROM python:3.11 ✅ cache"] --> B2["RUN pip install pandas ✅ cache"]
+        B2 --> C2["COPY app.py . ⏱ cambió!"]
+        C2 --> D2["CMD python app.py ⏱ reconstruye"]
+    end
+
+    style A1 fill:#1a3a5c,stroke:#2a6a9c
+    style B1 fill:#1a3a5c,stroke:#2a6a9c
+    style C1 fill:#1a3a5c,stroke:#2a6a9c
+    style D1 fill:#1a3a5c,stroke:#2a6a9c
+    style A2 fill:#2d5a1e,stroke:#4a8f32
+    style B2 fill:#2d5a1e,stroke:#4a8f32
+    style C2 fill:#8b1a1a,stroke:#cc3333
+    style D2 fill:#8b1a1a,stroke:#cc3333
+```
+
+### Por qué el orden del Dockerfile importa (mucho)
+
+Ahora veamos por qué esto tiene consecuencias prácticas. Considera un proyecto de Python con un `requirements.txt` y tu código `app.py`. Hay dos formas de escribir el Dockerfile:
+
+**Mal: copiar todo primero, instalar después**
+
+```dockerfile
+FROM python:3.11
+WORKDIR /app
+COPY . .                         # Capa 3: copia TODO (requirements.txt + app.py)
+RUN pip install -r requirements.txt  # Capa 4: instala dependencias
+CMD ["python", "app.py"]
+```
+
+**Bien: instalar dependencias primero, copiar código después**
+
+```dockerfile
+FROM python:3.11
+WORKDIR /app
+COPY requirements.txt .              # Capa 3: copia SOLO requirements.txt
+RUN pip install -r requirements.txt  # Capa 4: instala dependencias
+COPY . .                             # Capa 5: copia el código
+CMD ["python", "app.py"]
+```
+
+¿Cuál es la diferencia? En el primer caso, **cualquier cambio en tu código** (una línea en `app.py`) invalida la capa del `COPY . .`, y como el cache es secuencial, eso **también invalida** el `RUN pip install`. Resultado: cada vez que cambias una línea de código, Docker reinstala **todas** las dependencias desde cero. Si tu proyecto tiene muchas dependencias, eso puede tomar minutos.
+
+En el segundo caso, `requirements.txt` rara vez cambia. Solo cuando agregas o quitas una dependencia. Entonces la capa de `pip install` se mantiene en cache la mayoría de las veces, y solo se reconstruye la capa del `COPY . .` (que es instantánea).
+
+| Escenario | Dockerfile "mal" | Dockerfile "bien" |
+|-----------|-------------------|--------------------|
+| Cambié una línea de `app.py` | Reinstala todas las dependencias | Solo recopia el código (segundos) |
+| Agregué una dependencia a `requirements.txt` | Reinstala todas las dependencias | Reinstala dependencias (necesario) |
+| No cambié nada | Cache completo | Cache completo |
+
+La regla general: **lo que cambia con menos frecuencia va arriba, lo que cambia seguido va abajo**. Esto aplica en cualquier lenguaje:
+
+```dockerfile
+# Node.js — mismo patrón
+COPY package.json package-lock.json .
+RUN npm install
+COPY . .
+
+# Rust — mismo patrón
+COPY Cargo.toml Cargo.lock .
+RUN cargo build --release
+COPY src/ src/
+```
+
 ## Dockerfile: la receta
 
 Un Dockerfile es un archivo de texto (sin extensión) con instrucciones para construir una imagen.

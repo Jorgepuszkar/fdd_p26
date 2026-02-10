@@ -2,7 +2,7 @@
 
 Los contenedores prometen ser "casi nativos" en rendimiento. Pero ¿qué tan cerca están? ¿Docker y Podman rinden igual? En esta sección vamos a **medir**, no asumir.
 
-Vamos a correr seis experimentos que miden diferentes aspectos del rendimiento:
+Vamos a correr nueve experimentos que miden diferentes aspectos del rendimiento:
 
 | # | Experimento | ¿Qué mide? |
 |---|------------|-------------|
@@ -12,6 +12,9 @@ Vamos a correr seis experimentos que miden diferentes aspectos del rendimiento:
 | 4 | Disk I/O | Velocidad de escritura: overlay vs volumen vs bare metal |
 | 5 | Nested containers | Contenedores dentro de contenedores |
 | 6 | Scaling | Comportamiento al escalar a muchos contenedores |
+| 7 | CPU puro (exec) | CPU sin overhead de startup, vía `docker exec` |
+| 8 | Memoria cgroup | Memoria por contenedor vía cgroup (exacta) |
+| 9 | Nested v2 | 6 enfoques diferentes para contenedores anidados |
 
 > **Importante**: Los resultados varían según tu hardware, SO y versiones de Docker/Podman. Lo valioso no son los números exactos sino las **tendencias** y **proporciones**.
 
@@ -31,6 +34,9 @@ bash bench_cpu.sh
 bash bench_io.sh
 bash bench_nested.sh
 bash bench_scale.sh
+bash bench_cpu_exec.sh
+bash bench_memory_cgroup.sh
+bash bench_nested_v2.sh
 
 # Generar gráficas (requiere matplotlib)
 pip install -r requirements.txt
@@ -751,16 +757,198 @@ bash bench_scale.sh
 
 ---
 
+## Experimento 7: CPU puro (sin startup)
+
+**Objetivo**: El Experimento 3 midió 12-20% de overhead de CPU, pero ese número incluye el tiempo de startup del contenedor y la carga del binario de bash. ¿Cuánto overhead hay realmente una vez que el contenedor ya está corriendo?
+
+### ¿Qué medimos?
+
+El mismo loop de bash, pero usando `docker exec` en un contenedor **ya corriendo** en vez de `docker run` (que crea uno nuevo). Esto aísla el overhead puro de CPU.
+
+Redujimos el conteo a 1,000,000 (vs 10M del Exp 3) para que cada medición tome ~5 segundos en vez de ~50.
+
+### El script
+
+```bash
+#!/bin/bash
+# bench_cpu_exec.sh - CPU sin startup
+# Pre-arranca el contenedor, luego mide vía exec
+docker run -d --name cpu_test ubuntu sleep 300
+sleep 1  # estabilizar
+
+CPU_CMD='i=0; while [ $i -lt 1000000 ]; do i=$((i+1)); done'
+
+# Bare metal
+time bash -c "$CPU_CMD"
+
+# Docker exec (sin startup)
+time docker exec cpu_test bash -c "$CPU_CMD"
+
+docker rm -f cpu_test
+```
+
+### Resultados de referencia
+
+Se ejecutó 3 veces por runtime. El contenedor se pre-arrancó y se esperó 1 segundo antes de medir.
+
+**Datos crudos (segundos, contando hasta 1M):**
+
+| Rep | Bare Metal | Docker exec | Podman exec |
+|-----|-----------|-------------|-------------|
+| 1 | 4.82 | 5.16 | 5.32 |
+| 2 | 4.60 | 4.68 | 5.71 |
+| 3 | 5.18 | 4.61 | 5.23 |
+
+**Promedios y overhead:**
+
+| Runtime | Promedio | Overhead % |
+|---------|---------|------------|
+| Bare Metal | **4.87s** | — |
+| Docker exec | **4.82s** | **-1.1%** |
+| Podman exec | **5.42s** | **+11.4%** |
+
+**Comparación con Experimento 3 (docker run):**
+
+| Runtime | Overhead con `run` (Exp 3) | Overhead con `exec` (Exp 7) | Diferencia |
+|---------|---------------------------|----------------------------|------------|
+| Docker | +12.3% | **-1.1%** | El overhead de Docker era **todo startup** |
+| Podman | +20.2% | **+11.4%** | ~9% era startup, ~11% es overhead real de fuse-overlayfs |
+
+**Análisis**: Docker exec tiene **cero overhead de CPU** — el resultado de -1.1% está dentro del margen de error (ruido de ~0.5s entre repeticiones). Esto confirma que los contenedores Docker no añaden overhead al cómputo puro; todo el +12.3% del Exp 3 venía de crear namespaces, montar el overlay y cargar el binario de bash.
+
+Podman sigue mostrando ~11% de overhead incluso sin startup. Esto es consistente con `fuse-overlayfs`: cada vez que el intérprete de bash lee un archivo (librerías, el script mismo), pasa por una capa FUSE en espacio de usuario. En un loop de 1M iteraciones, ese overhead se acumula.
+
+> **Conclusión**: Para tareas de cómputo puro, Docker tiene **0% de overhead** una vez que el contenedor está corriendo. Podman tiene ~11% por fuse-overlayfs, que desaparece si usas Podman como root (overlay nativo del kernel).
+
+![Comparación de CPU: exec vs run](./images/cpu_exec_comparison.png)
+
+---
+
+## Experimento 8: Memoria cgroup (medición exacta)
+
+**Objetivo**: El Experimento 2 usó `free -m` y obtuvo valores negativos porque el ruido del sistema (~50-150 MB) era mayor que la señal (~4 MB por contenedor). Necesitamos un instrumento más preciso.
+
+### ¿Qué medimos?
+
+Usamos `docker stats` / `podman stats` que lee `memory.current` del cgroup de cada contenedor — da la memoria **exacta** asignada por el kernel a ese contenedor específico, inmune al ruido del sistema.
+
+También medimos el RSS (Resident Set Size) del daemon de Docker (`dockerd`) y de los procesos `conmon` de Podman.
+
+### El script
+
+{% raw %}
+```bash
+#!/bin/bash
+# bench_memory_cgroup.sh - Memoria exacta por contenedor
+
+# Lanzar contenedores
+docker run -d --name mem_test ubuntu sleep 3600
+
+# Leer memoria del cgroup vía stats
+docker stats --no-stream --format '{{.Name}},{{.MemUsage}}'
+
+# Medir RSS del daemon
+ps -p $(pgrep -x dockerd) -o rss=
+```
+{% endraw %}
+
+### Resultados de referencia
+
+Se midió con 1, 3 y 5 contenedores idle (`sleep 3600`).
+
+**Memoria por contenedor (cgroup):**
+
+| Contenedores | Docker (KB/cont) | Podman (KB/cont) |
+|-------------|-------------------|-------------------|
+| 1 | 432 | 94 |
+| 3 | 428 | 99 |
+| 5 | 429 | 98 |
+
+**Comparación: cgroup vs free -m (Exp 2):**
+
+| Método | Docker 1 cont. | Docker 5 cont. | Podman 1 cont. | Podman 5 cont. |
+|--------|----------------|-----------------|-----------------|-----------------|
+| `free -m` (Exp 2) | -41 MB | +71 MB | +39 MB | -143 MB |
+| cgroup (Exp 8) | **432 KB** | **2,148 KB** | **94 KB** | **490 KB** |
+
+La diferencia es abismal. `free -m` reportaba ±143 MB de fluctuación mientras que el dato real era **menos de 500 KB por contenedor**.
+
+**Overhead del daemon / conmon:**
+
+| Métrica | 0 cont. | 1 cont. | 3 cont. | 5 cont. |
+|---------|---------|---------|---------|---------|
+| dockerd RSS | 116.7 MB | 116.9 MB | 119.1 MB | 121.6 MB |
+| conmon RSS | 0 MB | 1.8 MB | 5.2 MB | 8.8 MB |
+
+**Análisis**:
+
+- **Docker**: Cada contenedor usa ~430 KB de memoria de cgroup. El daemon `dockerd` consume ~117 MB como costo fijo (¡con 0 o 5 contenedores!), creciendo solo ~1 MB por contenedor extra.
+- **Podman**: Cada contenedor usa solo ~97 KB de memoria de cgroup — **4.4x menos que Docker**. No hay daemon; cada contenedor tiene un proceso `conmon` (container monitor) que usa ~1.8 MB, creciendo linealmente.
+- **Costo total para 5 contenedores**: Docker = 122 MB (daemon) + 2.1 MB (containers) = ~124 MB. Podman = 9 MB (conmon) + 0.5 MB (containers) = ~9.5 MB. Podman usa **13x menos memoria total**.
+
+> **Lección de benchmarking**: La herramienta de medición importa tanto como lo que mides. `free -m` mide el sistema completo (ruido >> señal), mientras que `docker stats` lee el cgroup específico del contenedor (señal pura). Siempre usa el instrumento más específico disponible.
+
+![Memoria por contenedor vía cgroup y RSS del daemon](./images/memory_cgroup_comparison.png)
+
+---
+
+## Experimento 9: Nested containers v2
+
+**Objetivo**: El Experimento 5 probó 2 enfoques y ambos fallaron. Aquí probamos **6 enfoques diferentes** para entender cuáles funcionan y por qué.
+
+### Los 6 enfoques
+
+| # | Runtime | Enfoque | Descripción |
+|---|---------|---------|-------------|
+| 1 | Docker | `dind_privileged` | Docker-in-Docker clásico con `--privileged` |
+| 2 | Docker | `socket_mount` | Montar `/var/run/docker.sock` (patrón CI/CD) |
+| 3 | Docker | `dind_relaxed_security` | DinD con AppArmor/seccomp deshabilitados + `SYS_ADMIN` |
+| 4 | Podman | `pinp_basic` | `--security-opt label=disable --device /dev/fuse` |
+| 5 | Podman | `pinp_privileged` | Con `--privileged` |
+| 6 | Podman | `pinp_vfs` | Con storage driver VFS (evita overlay-in-overlay) |
+
+### Resultados de referencia
+
+| # | Runtime | Enfoque | Resultado | Tiempo | Error |
+|---|---------|---------|-----------|--------|-------|
+| 1 | Docker | dind_privileged | **Error** | 30.6s | Timeout: el daemon interno no pudo conectar al socket |
+| 2 | Docker | socket_mount | **Success** | 2.9s | — |
+| 3 | Docker | dind_relaxed_security | **Error** | 30.5s | Mismo problema que #1 |
+| 4 | Podman | pinp_basic | **Error** | 2.4s | `mount proc: Operation not permitted` |
+| 5 | Podman | pinp_privileged | **Success** | 2.6s | — |
+| 6 | Podman | pinp_vfs | **Error** | 2.6s | `mount proc: Operation not permitted` |
+
+**Solo 2 de 6 enfoques funcionaron**: socket mount (Docker) y privileged (Podman).
+
+### Análisis por enfoque
+
+**Docker DinD (#1, #3) — Fallaron**: El contenedor `docker:dind` intenta arrancar un daemon `dockerd` interno. El daemon intenta conectar a `tcp://docker:2375` (que no existe en este entorno). Ni `--privileged` ni la relajación de seguridad resuelven esto porque el problema es de red/DNS, no de permisos. En un ambiente con Docker Compose y un servicio `docker:dind` separado, esto sí funciona.
+
+**Docker socket mount (#2) — Funcionó**: Montar el socket del host (`/var/run/docker.sock`) permite al contenedor hablar con el Docker daemon del host. Técnicamente **no es nesting real** (no hay Docker dentro de Docker), pero es el patrón más usado en CI/CD porque es simple y rápido (~2.9s). El trade-off: el contenedor tiene acceso completo al daemon del host — puede ver, crear y eliminar **todos** los contenedores.
+
+**Podman básico y VFS (#4, #6) — Fallaron**: `mount proc: Operation not permitted` indica que el user namespace del Podman interior no tiene permisos para montar `/proc`. Esto requiere que el kernel permita nested user namespaces y que `/proc/sys/kernel/unprivileged_userns_clone` esté habilitado.
+
+**Podman privileged (#5) — Funcionó**: `--privileged` desactiva todas las restricciones de seguridad, permitiendo que el Podman interior monte `/proc` y cree sus propios namespaces. Funcionó en 2.6 segundos — más rápido que el socket mount de Docker.
+
+> **Conclusión práctica**: Para CI/CD, usa **socket mount** — es el enfoque más simple y no requiere `--privileged`. Para Podman, necesitas `--privileged` o una configuración cuidadosa del kernel para permitir nested user namespaces. En ambos casos, ten cuidado con las implicaciones de seguridad.
+
+![6 enfoques para contenedores anidados](./images/nested_v2_comparison.png)
+
+---
+
 ## Tabla resumen de resultados
 
 | Aspecto | Bare Metal | Docker | Podman | Veredicto |
 |---------|-----------|--------|--------|-----------|
 | **Startup** | ~1.3 ms | ~308 ms | ~178 ms | Podman más rápido (fork-exec directo) |
-| **CPU** | ~47s | ~53s (+12%) | ~57s (+20%) | Overhead bajo; incluye startup |
-| **Memoria (escala)** | — | +199 MB / 50 cont. | +87 MB / 50 cont. | Podman menos overhead |
+| **CPU (run)** | ~47s | ~53s (+12%) | ~57s (+20%) | Overhead bajo; incluye startup |
+| **CPU (exec)** | ~4.87s | ~4.82s (-1%) | ~5.42s (+11%) | Docker = 0% overhead real |
+| **Memoria (free -m)** | — | +199 MB / 50 cont. | +87 MB / 50 cont. | Ruidoso — ver cgroup |
+| **Memoria (cgroup)** | — | 430 KB/cont | 97 KB/cont | Podman 4.4x menos |
 | **I/O overlay** | ~470 MB/s | ~377 MB/s | ~1.7 GB/s* | *Podman: page cache, no disco real |
 | **I/O volume** | ~470 MB/s | ~507 MB/s | ~513 MB/s | Ambos ≈ nativo |
-| **Nested** | — | Falló (`--privileged`) | Falló (config requerida) | Ambos difíciles en entornos restringidos |
+| **Nested (Exp 5)** | — | Falló | Falló | Ambos difíciles |
+| **Nested v2** | — | Socket mount ✓ | Privileged ✓ | 2 de 6 enfoques funcionan |
 | **Escalamiento (50)** | — | 10.7s | 5.3s | Podman 2x más rápido |
 
 > \* El resultado de Podman overlay es engañoso — ver el análisis en el Experimento 4.
@@ -769,7 +957,7 @@ bash bench_scale.sh
 
 ## Conclusiones
 
-1. **El overhead de CPU es bajo, pero no cero.** Medimos ~12-20%, pero esto incluye startup y diferencias en versiones de bash. Para tareas de cómputo intensivo que duran minutos u horas, el overhead del contenedor es despreciable.
+1. **El overhead de CPU es cero (Docker) o bajo (Podman).** El Exp 3 midió 12-20%, pero el Exp 7 demostró que al eliminar el startup, Docker tiene **0% de overhead** (-1.1%, dentro del margen de error). Podman mantiene ~11% por fuse-overlayfs. Para tareas de cómputo intensivo, el overhead del contenedor es despreciable.
 
 2. **El costo principal es el startup.** Crear namespaces, montar overlays y configurar cgroups toma cientos de milisegundos (~180-310 ms en nuestras pruebas). Esto importa si creas/destruyes contenedores frecuentemente (como en serverless o CI/CD).
 
@@ -777,9 +965,13 @@ bash bench_scale.sh
 
 4. **Podman sorprende en rendimiento.** Contrario a la sabiduría convencional, Podman fue más rápido en startup (178 vs 308 ms) y en escalamiento (5.3s vs 10.7s para 50 contenedores). El modelo fork-exec sin daemon es más eficiente que la arquitectura cliente-daemon de Docker. La frase "Docker es más rápido porque tiene daemon pre-calentado" no se sostuvo en nuestras pruebas.
 
-5. **Medir es difícil.** Tres de nuestros seis experimentos produjeron resultados que requirieron análisis cuidadoso: la memoria fue ruidosa, el I/O de Podman overlay midió RAM en vez de disco, y los contenedores anidados fallaron. Esto es normal en benchmarking — la habilidad no es solo correr el script, sino **interpretar los resultados críticamente**.
+5. **La herramienta de medición importa.** El Exp 2 (`free -m`) reportó -41 MB para 1 contenedor Docker. El Exp 8 (cgroup) midió 432 KB. La diferencia: 5 órdenes de magnitud. Siempre usa el instrumento más específico disponible — `docker stats` lee el cgroup exacto del contenedor, inmune al ruido del sistema.
 
-6. **Para ciencia de datos**: el overhead es irrelevante. Tu modelo de ML no va a ser más lento en un contenedor. El beneficio de reproducibilidad supera por mucho el costo de rendimiento.
+6. **Contenedores anidados: el pragmatismo gana.** De 6 enfoques probados, solo 2 funcionaron: socket mount (Docker, el patrón CI/CD) y `--privileged` (Podman). DinD puro falló por configuración de red. La solución práctica es montar el socket del daemon — no es "nesting real" pero resuelve el caso de uso real.
+
+7. **Medir es difícil.** Varios de nuestros experimentos produjeron resultados que requirieron análisis cuidadoso: la memoria fue ruidosa, el I/O de Podman overlay midió RAM en vez de disco, y los contenedores anidados fallaron inicialmente. Esto es normal en benchmarking — la habilidad no es solo correr el script, sino **interpretar los resultados críticamente** y buscar mejores instrumentos cuando los resultados no tienen sentido.
+
+8. **Para ciencia de datos**: el overhead es irrelevante. Tu modelo de ML no va a ser más lento en un contenedor. El beneficio de reproducibilidad supera por mucho el costo de rendimiento.
 
 :::prompt{title="Analizar resultados de benchmarks" for="ChatGPT/Claude"}
 
