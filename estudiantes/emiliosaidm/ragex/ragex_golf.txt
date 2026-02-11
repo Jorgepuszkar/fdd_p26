@@ -18,3 +18,8 @@ Proceso de pensamiento: Investigando, determine que hacia \b (word boundary); co
 Regex usado: ^[a-f]+$
 Explicación: Hace match de todas las palabras cuyos caracteres estén entre la a y la f de principio a fin. 
 Proceso de pensamiento: Las palabras buenas tienen caracteres que oscilan entre a y f. Forcé utilizar palabras de la a a la f en cada carácter de la palabra. 
+
+=== NIVEL Backrefs ===
+Regex usado: (...).*\1
+Explicación: (...) es un grupo de cualquiera 3 caracteres. Luego .* permite uno o mas elementos cualesquiera después de ese grupo. \1 exige que vuelva a salir el grupo 1 en cualquier parte del string
+Proceso de pensamiento: Las palabras que debía de cachar el Ragex tenia grupos de 3 palabras que salen 2 veces exactamente. Por ejemplo, en allochirally salía el grupo all al inicio y casi al final otra ves. Eso sucede en todas las cadenas. Al inicio hice una cosa muy compleja, pero viendo documentación en internet vi que había forma de referenciar grupos.
