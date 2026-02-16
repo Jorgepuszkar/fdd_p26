@@ -1,0 +1,43 @@
+David Vargas Hernández - 000218993
+
+=== NIVEL 6->7 === (Contraseña: morbNTDkSW6jIlUc0ymOdMaLnOlFVAaj)
+1. Tengo que encontrar la contraseña que está en algún lado del servidor y el archivo tiene ciertas propiedades especificas.
+
+2. ssh usuario@host -p, pwd, ls, cat, exit, find 
+3. Busque en internet cuáles eran las banderas del find para acordarme y que hacer si un comando me devuelve "permisson denied". Ambas cosas las encontré aquí: https://www.booleanworld.com/guide-linux-find-command/
+
+4. ssh bandit6@bandit.labs.overthewire.org -p 2220, pwd, ls, find / -type f -size 33c -user bandit7 -group bandit6 2>/dev/null, cat /var/lib/dpkg/info/bandit7.password, exit
+
+5. La verdad estuve un rato intentando buscar con el find correcto pero desde ruta donde inicias y no me devolvía nada entonces creí que el nivel estaba roto o algo, pero luego se me ocurrió buscar desde el root y creí que ya lo había resuelto pero me arrojó demasiados creo que archivos y directorios pero con el mensaje "permisson denied" entonces tuve que buscar qúe hacer.
+
+=== NIVEL 7->8 === (Contraseña: dfwvzFQi4mU0wfNbFOe9RoWskMLg7eEc)
+1. Encontrar la contraseña en el archivo data.txt que está al lado de la palabra millionth.
+2. ssh usuario@host -p, pwd, ls, cat, exit, grep
+3. No busqué. 
+4. ssh bandit7@bandit.labs.overthewire.org -p 2220, pwd, ls, cat data.txt (fue mala idea, porque salio demasiado texto hasta que me sacó del nivel), grep "millionth" data.txt, exit
+5. Sí, todo salió bien.
+
+=== NIVEL 8->9 === (Contraseña: 4CKMh1JI91bUIZZPXDqGanal4xvAg0JM)
+1. La contraseña otra vez está en un archivo llamado data.txt pero dice que es la única línea de texto que aparece solo una vez.
+2. ssh usuario@host -p, pwd, ls, cat, exit, sort, uniq 
+3. Busqué en internet si había un comando que buscaba líneas unicas en un texto y me salió que de hecho es un conjunto de 2 comando que hasta después vi que los recomendaba el propio ejercicio de bandit. Pero entonces en la pagina me salio qué comandos eran y cómo implementarlos juntos. Lo encontre aquí: https://stackoverflow.com/questions/13778273/find-unique-lines
+
+4. ssh bandit8@bandit.labs.overthewire.org -p 2220, pwd, ls, cat data.txt, sort data.txt | uniq -u, exit
+5. Sí, todo funcionó y no tuve grandes problemas.
+
+=== NIVEL 9->10 === (Contraseña: FGUW5ilLVJrxX9kMYMmlN4MgbpfMiqey)
+1. Encontrar la contraseña dentro del archivo data.txt en una de las pocas human-readable strings que tiene antes muchos signos "=".
+2. ssh usuario@host -p, pwd, ls, cat, exit, grep
+3. Como no me resultó solo con grep (salía que sí encontró coincidencias pero no las imprimía y supuse que era porque no era human readable), revisé los comandos sugeridos en la pagina de bandit y entonces revisé el manual de "strings".
+4. ssh bandit9@bandit.labs.overthewire.org -p 2220, pwd, ls, cat data.txt, grep "=*" data.txt, strings data.txt (para ser sincero con solo este comando ya había encontrado la contraseña con hacer un poco de scroll, pero lo quise hacer bien así que hice le siguiente comando), strings data.txt | grep "=*", exit 
+5. Sí, todo salió bien y sin mucho problema.
+
+=== NIVEL 10->11 === (Contraseña: dtR173fZKb0RRsDFSGsg2RWnpNVj3qRr)
+1. Debo encontrar otra vez la contraseña en data.txt pero ahora dice que su contenido está codificada en base64.
+2. ssh usuario@host -p, pwd, ls, cat, exit, base64
+3. Busqué en el manual de base64 y fue muy claro lo que tenia que hacer. 
+4. ssh bandit10@bandit.labs.overthewire.org -p 2220, pwd, ls, base64 -d data.txt, exit
+5. Sí, todo funcionó bien sin problemas.
+
+
+
